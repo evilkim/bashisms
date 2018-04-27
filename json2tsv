@@ -1,0 +1,142 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# HELP - Convert JSON into tab-separated columns (TSV)
+#
+USAGE="${IDENT:=${0##*/}} [OPTIONS] [JSON]"
+#
+# DESCRIPTION
+#
+# Convert JSON into tab-separated columns (TSV).
+#
+# N.B. Multi-level / complex JSON objects are not suitable. Keys should all
+# have simple integer, string, or null values.
+#
+# OPTIONS
+#
+# -h|--help	Print HELP and USAGE lines, suggest --manpage, and exit.
+#
+# --manpage	Print this message and exit.
+#
+# -d|--debug	Enable diagnostic messages.
+#
+# -q|--quiet	Disable informational messages.
+#
+# -v|--verbose	Enable extra informational messages.
+#
+# -W|--no-warnings
+#		Suppress warning messages.
+#
+# --		Required if the first non-OPTION starts with a '-'.
+#
+# --empty EMPTY
+#		Replace empty columns (missing keys) with EMPTY. The
+#		default is the null value which results in an empty
+#		column.
+#
+# -k|--keys KEYS
+# 		Comma separated list of keys (columns). Implies --no-sort.
+#
+# --no-addkeys
+#		Do not add missing keys (columns). This will result in
+#		uneven rows unless all JSON objects already have the
+#		same set of keys.
+#
+# --no-headers
+#		Do not add column headers.
+#
+# --no-sort
+# 		Do not sort output columns by keys (headers). This can
+# 		lead to confusing results unless all the same keys
+# 		exist for every JSON object and are already in the
+# 		same order.
+# 
+# --padding	Align columns by padding with spaces.
+# 
+# -r|--rotate	Rotate table so that column headers become row headers instead.
+# 
+# SEE ALSO
+# * jq
+# * txt2table
+# * json-addkeys
+# * https://stackoverflow.com/questions/30015555/\
+    # how-to-add-a-header-to-csv-export-in-jq
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+BINDIR=$(cd $(dirname $0) && pwd)
+
+#-----------------------------------------------------------------------------#
+# OPTIONS
+
+PATH="$BINDIR:$PATH"\
+    GETOPT_SHORT=rk:\
+    GETOPT_LONG=empty:,no-headers,padding,no-sort,no-addkeys,rotate,keys:\
+    source getopt.sh || exit
+
+NO_HEADERS=${GETOPT[no-headers]:-false}
+
+NO_SORT=${GETOPT[no-sort]:-false}
+NO_ADDKEYS=${GETOPT[no-addkeys]:-false}
+
+EMPTY=${GETOPT[empty]:-""}
+
+PADDING=${GETOPT[padding]:-false}
+
+ROTATE=${GETOPT[rotate]:-${GETOPT[r]:-false}}
+if $ROTATE; then ROTATE=--rotate; else ROTATE=; fi
+
+KEYS=${GETOPT[keys]:-${GETOPT[k]:-""}}
+if [[ -n $KEYS ]]; then
+    # A,B,C => [.A,.B,.C]
+    NO_SORT=true
+    #KEYS="[.${KEYS//,/,.}]"
+else
+    KEYS=.			# identity transform
+fi
+
+
+#-----------------------------------------------------------------------------#
+# FUNCTIONS
+
+:
+
+#-----------------------------------------------------------------------------#
+# main()
+
+# Found this method, but it seemed more obtuse to me:
+# '(.[0] | to_entries | map(.key)),(.[] | [.[]]) | @tsv'
+
+# Replace array of objects with one object per line.
+# Remove any keys with an embedded object or array value.
+jq -c '
+if type == "array" then .[] else . end |
+to_entries |
+[ .[] | select(.value | type != "object" and type != "array") ] |
+[ .[] | select(length > 0) ] |
+from_entries
+' $@ |
+    if $NO_ADDKEYS; then
+	cat
+    else
+	($DEBUG && set -x;
+	 json-addkeys ${GETOPT[OPTIONS]} ${EMPTY:+-null="$EMPTY"} $@)
+    fi |
+    # Sort or Reordering has to follow addkeys and precede @tsv
+    if $NO_SORT; then
+	($DEBUG && set -x; jq -c "{$KEYS}")
+    else
+	($DEBUG && set -x; jq --sort-keys .)
+    fi |
+    if $NO_HEADERS; then
+	# N.B. No issue with empty input here
+	($DEBUG && set -x; jq -s -r '.[] | map(.) | @tsv')
+    else
+	# N.B. Empty input here leads to:
+	# assertion "cb == jq_util_input_next_input_cb" failed
+	# Using '.? | ...' prevents this. (See also ifne.)
+	($DEBUG && set -x;
+	 jq -s -r\
+	    '.? | (.[0] | to_entries | map(.key)), (.[] | map(.)) | @tsv')
+    fi |
+    if $PADDING; then txt2table $ROTATE; else cat; fi
