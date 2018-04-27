@@ -1,0 +1,98 @@
+#!/usr/bin/perl -ws
+# HELP - Convert LDIF file(s) or stdin to JSON on stdout
+
+use MIME::Base64;		# Should we decode base64 attr:: value?
+use strict;
+use vars qw($debug $d $decode);	 # optional -d|-debug and -decode switches
+
+my ($dn, %json, $attr);
+
+sub _debug { warn("debug: file $ARGV: ",
+		  ($. ? "line $." : "at EOF"),
+		  ": @_\n") if ($debug or $d);
+}
+
+while (<>) {
+    s/\s+\Z//;			# like chomp but handles \r\n too
+    
+    _debug($1) if s/^(#.*)//;	# referrals, pagination, what else?
+    # _debug($_); # TODO: Implement -verbose w/ -debug as needed
+    
+    #/^dn:\s+(.+)/ and do {
+    /^dn:\s*(.*)/i and do {
+	$json{$dn} ||= {} if (defined $dn);  # In case prev DN had no ATTRS
+	$dn = defined $1 ? $1 : "";	     # Only seen for ldapsearch -b ""
+	_debug("dn set to '$dn'");
+	next;
+    };
+    /^(\S+):\s+(.+)/ and do {
+	$attr = $1;
+	my $value = $2;
+	
+	# Double escape any reverse solidus (\) character except where
+	# it precedes a legal JSON escape sequence: \[\\/"bfnrt], or
+	# \u[0-9a-fA-F]{4}, according to http://json.org.
+	# $value =~ s{(?<!\\)\\(?![\\/"bfnrt]|u[0-9a-fA-F]{4})}{\\\\}g;
+	
+	# XXX: But, e.g. AD homeDirectory contains literal \\server\home\user
+	# that must be fully escaped? And why should / ever be escaped?
+	$value =~ s{\\(?!["bfnrt]|u[0-9a-fA-F]{4})}{\\\\}g;
+	
+	if ($attr =~ s/(.+):$/$1/) {
+	    _debug("$attr has a base64 encoded value: $value => ",
+		   MIME::Base64::decode_base64($value));
+	    if ($decode) {
+		$value = '"'.MIME::Base64::decode_base64($value).'"';
+	    } else {
+		# Instead of decoding it, make it an object. Let user decide.
+		$value = qq({ "base64": "$value" });
+	    }
+	} else {
+	    $value = qq("$value");
+	}
+	_debug("$attr set to '$value'");
+	push(@{ $json{$dn}->{$attr} }, $value);
+	next;
+    };
+    /^\s+(\S.*)/ and do {
+	# Oops, trailing continuation
+	if (exists $json{$dn}) {
+	    my @values = @{ $json{$dn}->{$attr} };
+	    _debug("appending '$1' to attr $attr of $dn");
+	    $values[$#values] .= $1;
+	    $json{$dn}->{$attr} = [ @values ];
+	} else {
+	    _debug("appending '$1' to dn $dn");
+	    $dn .= $1;
+	}
+	next;
+    };
+    # TODO: Seen from ActiveDirectory: line-wrapped comments!?!?
+    /\S/ && die("assertion failed: [$_]");
+}
+
+END {
+    $. = 0;			# Flags EOF, see _debug()
+    for my $dn (sort keys %json) {
+	$dn =~ s{\\(?!["bfnrt]|u[0-9a-fA-F]{4})}{\\\\}g;
+
+	# Simple formatting. Use jq to pretty-print properly.
+	# See https://stedolan.github.io/jq/.
+	print STDOUT (qq({\n\t"dn": "$dn"));
+	my @attrs;
+	for my $attr (sort keys %{ $json{$dn} }) {
+	    my @values = @{ $json{$dn}->{$attr} };
+	    if (@values > 1) {
+		push(@attrs, (qq("$attr": [\n\t\t).
+			      join(",\n\t\t", @values).
+			      "\n\t]"));
+	    } else {
+		push(@attrs, (qq("$attr": $values[0])));
+	    }
+	}
+	if (@attrs) {
+	    print STDOUT (",\n\t", join(",\n\t", @attrs), "\n");
+	}
+	print STDOUT ("\n}\n");
+    }
+}
