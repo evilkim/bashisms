@@ -1,0 +1,91 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# HELP - Pad tab-separated columns so they align nicely
+#
+USAGE="${IDENT:=${0##*/}} [OPTIONS] [ARGS]"
+#
+# DESCRIPTION
+#
+# Pad tab-separated columns so they align nicely.
+#
+# OPTIONS
+#
+# -h|--help	Print HELP and USAGE lines, suggest --manpage, and exit.
+#
+# --manpage	Print this message and exit.
+#
+# -d|--debug	Enable diagnostic messages.
+#
+# -q|--quiet	Disable informational messages.
+#
+# -v|--verbose	Enable extra informational messages.
+#
+# -W|--no-warnings
+#		Suppress warning messages.
+# 
+# --		Required if the first non-OPTION starts with a '-'.
+# 
+# -r|--rotate	Rotate table so that column headers become row headers instead.
+# 
+# --no-lcd
+#		Do not format to Least Common Denominator.
+#		Newer variant of column(1) provides cleaner alignments.
+#		Requires Bash vserion 4.2+ (e.g. RHEL7, Cygwin).
+# 
+# --strip	Remove trailing spaces from tab-separated input
+#		columns.  This is to handle output from txt2table
+#		earlier in the pipeline (perhaps following insertion
+#		of a new column.)  N.B. Incompatible with LCD and may
+#		yield odd results on e.g. RHEL6.
+# 
+# SEE ALSO
+# * column(1)
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+BINDIR=$(cd $(dirname $0) && pwd)
+# PATH="$BINDIR:$PATH" source logging.sh || exit  # in lieu of source getopt.sh
+
+#-----------------------------------------------------------------------------#
+# OPTIONS
+
+PATH="$BINDIR:$PATH"\
+    GETOPT_SHORT=r\
+    GETOPT_LONG=rotate,no-lcd,strip\
+    source getopt.sh || exit
+
+ROTATE=${GETOPT[rotate]:-${GETOPT[r]:-false}}
+NO_LCD=${GETOPT[no-lcd]:-false}
+STRIP=${GETOPT[strip]:-false}
+
+#-----------------------------------------------------------------------------#
+# FUNCTIONS
+
+:
+
+#-----------------------------------------------------------------------------#
+# main()
+
+$DEBUG && set -o xtrace
+
+if $STRIP; then
+    perl -lpe 's/ *\t/\t/g' $@
+else
+    cat $@
+fi |
+    if $ROTATE; then
+	txt-rotate
+    else
+	cat
+    fi |
+    if $NO_LCD; then
+	# Bash 4.2+ (Cygwin, RHEL7)
+	column --table --separator $'\t' --output-separator $'\t'
+    else
+	# Bash 4.1 (RHEL6)
+	# Close approximation: Append tab after 2 spaces preceding each column.
+	# Columns aligned on tab stops end up 2 spaces wider than necessary.
+	# XXX: Confused by ^  +\S as for e.g. mds-orgchart.
+	column -t -s $'\t' | perl -lpe 's/  (?=\S)/  \t/g'
+    fi
