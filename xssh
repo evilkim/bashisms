@@ -1,0 +1,214 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# HELP - Run ssh using xargs per host on stdin.
+#
+USAGE="${IDENT:=${0##*/}} [OPTIONS] { -s SCRIPT | COMMAND } [[--] ARGS]"
+#
+# DESCRIPTION
+#
+# Invokes ssh using xargs to execute COMMAND (or SCRIPT) for the list of HOSTS
+# found on stdin, one per line:
+#
+#	xargs -I{} ssh -o BatchMode=yes {} ...
+#
+# Silent SSH public key access must already be configured to each HOST.
+#
+# With a given COMMAND (and optional ARGS), equivalent to:
+#	echo "COMMAND [ARGS]" | ssh -o BatchMode=yes {} bash -s
+#
+# With a given SCRIPT (and optional ARGS), equivalent to:
+#	cat SCRIPT | ssh -o BatchMode=yes {} bash -s [ARGS]
+#
+# N.B. It is difficult (impossible?) to preserve any whitespace within ARGS.
+#
+# OPTIONS
+#
+# -h|--help	Print USAGE (and suggest --manpage).
+#
+# --manpage	Print this message.
+#
+# -d|--debug	Enable diagnostic messages.
+#
+# -q|--quiet	Disable informational messages.
+#
+# -v|--verbose	Enable extra informational messages.
+#
+# -W|--no-warnings
+#		Suppress warning messages.
+#
+# --		Required if the first non-OPTION starts with a '-'.
+#
+# -t		Same as --verbose (the xargs equivalent, -t is for trace)
+#
+# -T|--no-timer
+: ${TIME:="elapsed\t%E"}
+#		Disable command timer. Implied by --quiet.
+#
+# -s|--script SCRIPT
+#		Run SCRIPT instead of COMMAND.
+#		The PATH is not searched (TODO: could be?) so the
+#		SCRIPT must be relative to PWD or fully qualified.
+#
+# -P|--max-procs MAX-PROCS
+#		Can greatly speed up overall response time. See xargs.
+#
+# -m|--map	Map common responses from groups of hosts together.
+#
+# --diff DIFF	Implies --map. Run DIFF @GRP001 @GRP002...
+#		Example: --diff="sdiff -s"
+#
+# --base INDEX	Use @GRP[INDEX] as the base for diff comparisons.
+#		INDEX starts at 1 (for @GRP001) and is restricted to ${#GRP}.
+#		Used to pick a more representative group for comparisons.
+#
+# SEE ALSO
+# * apply
+# * ssh
+# * xargs
+# * xssh-map.pl
+# * xssh-map-diff.pl
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+BINDIR=$(cd $(dirname $0) && pwd)
+PATH="$BINDIR:$PATH" source logging.sh || exit	# in lieu of source getopt.sh
+
+GETOPT_SHORT=P:ms:tT
+GETOPT_LONG=base:,diff:,map,max-procs:,script:,no-timer
+
+# Defaults:
+_P="-P1"		  # xargs -P|--max-procs MAX-PROCS
+P1=true			  # Single process by default
+MAP=false		  # Show output per host by default
+SCRIPT=""		  # Script to run instead of COMMAND
+DIFF=""
+BASE=1
+NO_TIMER=false
+
+#-----------------------------------------------------------------------------#
+# OPTIONS
+# https://gist.github.com/cosimo/3760587
+
+GETOPT_SHORT=hdqvW${GETOPT_SHORT}		# User-defined -o options
+
+GETOPT_LONG=${GETOPT_LONG:+,}${GETOPT_LONG}	# User-defined --long options
+GETOPT_LONG=help,manpage,debug,quiet,verbose,no-warnings${GETOPT_LONG}
+
+# Defaults:
+DEBUG=false
+QUIET=false
+VERBOSE=false
+WARNINGS=true
+
+getopt --test >/dev/null && { log_error "incompatible getopt(1)"; exit 1; }
+
+# With POSIXLY_CORRECT in the environment, parsing stops at 1st non-option
+GETOPT=$(env POSIXLY_CORRECT=\
+	     getopt -o "$GETOPT_SHORT" --long "$GETOPT_LONG" -- "$@")
+if [[ $? != 0 ]]; then log_usage "Try '$IDENT --manpage' for valid OPTIONS."; fi
+eval set -- $GETOPT
+
+declare -A GETOPT    # Associative array of user-defined option values
+
+while [[ "$1" == -* ]]; do
+    log_debug "getopt: [$1]"
+    case "$1" in
+	-h|--help|--manpage) log_help "$1";;
+	-d|--debug) DEBUG=true;;
+	-q|--quiet) QUIET=true;;
+	-v|--verbose|-t) VERBOSE=true;;	 # t is for trace
+	-W|--no-warnings) WARNINGS=false;;
+	--) shift; break;;	# canonical end of options
+	#---Custom options start here---#
+	-P|--max-procs)
+	    _P="-P$2"
+	    [[ "$2" -eq 1 ]]
+	    case $? in
+		0) P1=true;;
+		1) P1=false;;
+		*) log_usage "$1 $2: Expected an integer";;
+	    esac
+	    shift
+	    ;;
+	-m|--map) MAP=true;;
+	-T|--no-timer) NO_TIMER=true;;
+	-s|--script)
+	    SCRIPT="$2"; shift;;
+	--diff) MAP=true; DIFF="$2"; shift;;
+	--base) BASE="$2"; shift
+		[[ "$BASE" -gt 0 ]] || log_usage "--base out of range";;
+	--) shift; break;;		    # canonical end of options
+	-*) log_usage "unknown option: $1";;  # (notreached?)
+	*) break;;		# end of options (notreached?)
+    esac
+    shift
+done
+
+#-----------------------------------------------------------------------------#
+# main()
+
+_t=; $VERBOSE && _t=-t		# -t is the xargs equivalent
+
+# Needed for COMMAND and/or --map
+TMPDIR=$(mktemp --dir ${TMPDIR:-/tmp}/$IDENT.XXXX.d)
+if $DEBUG; then
+    log_debug "REMINDER: rm -rf $TMPDIR"
+else
+    trap "rm -rf $TMPDIR" EXIT HUP INT TERM
+fi
+
+if [[ -n "$SCRIPT" ]]; then
+    if [[ ! -f "$SCRIPT" ]]; then
+	case "$SCRIPT" in
+	    /*) ;;	 # fully qualified, nothing more we can do
+	    */*) ;;	 # partially qualified, nothing more we can do
+	    *) script=$(which "$SCRIPT" 2>/dev/null) && SCRIPT="$script";;
+	esac
+    fi
+    [[ -f "$SCRIPT" ]] || log_usage "--script $SCRIPT: No such file"
+else
+    case "$#" in 0) log_usage "missing COMMAND";; esac
+    # Run COMMAND via temporary script sent over ssh via stdin.
+    # This imposes consistent remote shell behavior when using
+    # --map or -P0 or --script.
+    SCRIPT=${TMPDIR}/script.sh
+    log_debug "Moving $# arg(s) to $SCRIPT"
+    echo "$@" > "$SCRIPT"
+    set --			# Clear positional arguments
+fi
+
+if $DEBUG; then _x=x; else _x=""; fi  # Enable xtrace in remote shell
+
+if $QUIET; then
+    TIMER=""
+    REDIRECT="2>&1"
+    EOF="cat"
+    RC=""
+else
+    if $NO_TIMER; then TIMER=; else TIMER=/usr/bin/time; fi
+    REDIRECT="2> >(perl -lpe 's/^/stderr\t/') 1> >(perl -lpe 's/^/\t/')"
+    EOF="(grep . || echo 'EOF')"
+    RC="rc=\${PIPESTATUS[1]}"
+    RC="$RC; if [[ \$rc -ne 0 ]]; then echo -e \"{}\tstatus\t\$rc\"; fi"
+fi
+
+# Prefix lines of output with hostname of origin
+# Whitespace is collapsed and replaced by line breaks
+perl -lpe 's/\s+/\n/g' | ($DEBUG && set -o xtrace; 
+ $TIMER xargs $_t $_P -i bash -c "cat $SCRIPT |
+ ssh -o BatchMode=yes {} bash -s$_x -- $* $REDIRECT | $EOF |
+ perl -lpe 's/^/{}\t/'; $RC"
+) |
+    if $MAP; then
+	xssh-map.pl |
+	    if [[ -n "$DIFF" ]]; then
+		export BASE DEBUG DIFF IDENT TMPDIR
+		($DEBUG && set -x; xssh-map-diff.pl)
+	    else
+		cat
+	    fi
+    else
+	cat
+    fi
+exit
