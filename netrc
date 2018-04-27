@@ -1,0 +1,118 @@
+#!/usr/bin/perl -s
+# HELP - Implement ACTION for devops-vault. 
+# ACTION ::= 'get' UPN | 'set' UPN PASSWORD | 'forget' UPN
+# UPN ::= LOGIN ('@' DOMAIN)? | LOGIN? '@' DOMAIN
+# LOGIN		/* Default: $ENV{USER} */
+# DOMAIN	/* Default: 'default' */
+
+use warnings;
+use strict;
+use vars qw($debug $quiet);
+use File::Basename;
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+my $IDENT = ($ENV{IDENT} || basename($0, '.pl'));
+my $USAGE = "Usage: $IDENT [-debug] [-quiet] ACTION UPN [PASSWORD]";
+
+#-----------------------------------------------------------------------------#
+# FUNCTIONS
+
+sub log_debug(@) { warn("$IDENT: debug: @_\n") if $debug; }
+sub log_info(@) { warn("$IDENT: info: @_\n") unless $quiet; }
+sub log_error(@) { warn("$IDENT: error: @_\n"); }
+sub log_usage(;@) {
+    log_error(@_) if @_;
+    warn("$USAGE\n");
+    exit(2);
+}
+
+#-----------------------------------------------------------------------------#
+# main()
+
+# Positional ARGS
+my $ACTION = shift @ARGV or log_usage("Missing ACTION");
+my $UPN = shift @ARGV or log_usage("Missing UPN");
+my $PASSWORD;			# set password
+
+my ($GET, $SET, $FORGET);
+if ($ACTION eq 'get') {
+    $GET++;
+} elsif ($ACTION eq 'forget') {
+    $FORGET++;
+} elsif ($ACTION eq 'set') {
+    $SET++;
+    $PASSWORD = shift @ARGV or log_usage("Missing PASSWORD");
+} else {
+    log_usage("Invalid ACTION: $ACTION");
+}
+
+my ($DOMAIN, $LOGIN) = ('default', $ENV{USER});
+$DOMAIN = "machine ${1}" if ($UPN =~ s/[@](.+)//);
+$LOGIN = $UPN if length($UPN);
+$LOGIN = "login ${UPN}";
+log_debug("DOMAIN=[$DOMAIN] LOGIN=[${LOGIN}]");
+
+my $STATUS = ($GET ? 1 : 0);
+
+if ($SET and ($DOMAIN ne 'default')) {
+    # Keep non-default domain entries at top
+    log_debug("line 0: $ACTION: ${DOMAIN} ${LOGIN} password [...]");
+    print STDOUT ("${DOMAIN} ${LOGIN} password ${PASSWORD}\n");
+}
+
+while (<>) {
+    chomp;
+    # Remove leading, trailing, squeeze remaining, whitespace
+    # XXX: No whitespace permitted in passwords?
+    s/^\s+//; s/\s+\z//; s/\s+/ /g;
+    # Capture and sanitize current line for diagnostics
+    my $sanitized = $_;
+    $sanitized =~ s/( password) .+/${1} [..]/;
+    # Handle matched / unmatched entries
+    if (/^((default|${DOMAIN}) ${LOGIN} password) (.+)/i) {
+	my ($matched, $domain, $password) = ($1, $2, $3);
+	if ($GET) {
+	    $STATUS = 0;
+	    log_debug("line $.: $ACTION: MATCHED: ${sanitized}");
+	    print STDOUT ("${password}\n");
+	    last;
+	} elsif ($SET) {
+	    if ($domain eq 'default') {
+		log_debug("line $.: $ACTION: UNMATCHED: PASSTHRU: ",
+			  ${sanitized});
+		print STDOUT ("$_\n");  # pass thru matched default entry
+	    } else {
+		log_debug("line $.: $ACTION: UNMATCHED: REPLACED: ",
+			  ${sanitized});
+		next;		# replacematched non-default entry
+	    }
+	} elsif ($FORGET) {
+	    # Don't forget default entry unless explicitly matched
+	    if ($domain eq $DOMAIN) {
+		log_debug("line $.: $ACTION: MATCHED: SKIPPED: ${sanitized}");
+		next;		# skip explicit default
+	    } else {
+		log_debug("line $.: $ACTION: MATCHED: PASSTHRU: ${sanitized}");
+		print STDOUT ("$_\n") ;  # pass thru non-explicit default
+	    }
+	}
+    } else {
+	if ($SET or $FORGET) {
+	    log_debug("line $.: $ACTION: UNNMATCHED: PASSTHRU: $sanitized");
+	    print STDOUT ("$_\n") ;  # pass thru unmatched
+	} else {
+	    log_debug("line $.: $ACTION: UNNMATCHED: IGNORED: $sanitized");
+	}
+    }
+}
+
+if ($SET and ($DOMAIN eq 'default')) {
+    # Keep default domain entries at end
+    my $line = ($. + 1);
+    log_debug("line $line: $ACTION: ${DOMAIN} ${LOGIN} password [...]");
+    print STDOUT ("${DOMAIN} ${LOGIN} password ${PASSWORD}\n");
+}
+
+exit($STATUS);
