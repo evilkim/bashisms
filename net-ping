@@ -1,0 +1,145 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Net::Ping;
+use File::Basename;
+
+my $IDENT = basename($0);
+my $USAGE = "Usage: $IDENT METHOD HOST...\n".
+    "Where:\n".
+    "\tMETHOD := icmp | tcp PORTS | syn PORTS\n".
+    "\tPORTS := PORT[,PORT]...\n";
+
+my $TIMEOUT = 7;		# (5 is the default)
+
+my $STATUS = 0;		     # 0 => EX_OK (PASS), 1 => EX_ERROR (FAIL)
+
+sub icmp_method(@) {
+    my (@hosts) = (@_);
+    my $method = "icmp";
+    my $ping = eval { Net::Ping->new($method, $TIMEOUT); };
+    if ($@) {
+	# Administrator 
+	(my $diag = $@) =~ s/ at .*? line \d+.\Z//;
+	die("$IDENT: fatal: $diag\n");
+    }
+    for my $host (@hosts) {
+	# If the hostname cannot be found or there is a problem with the IP
+	# number, the success flag returned will be undef. Otherwise, the
+	# success flag will be 1 if the host is reachable and 0 if it is not
+	my ($status, $rtt, $ip) = $ping->ping($host);
+	if (defined $status) {
+	    if ($status) {
+		print "$method\t$host\t$ip\tACK\t$rtt\n";
+	    } else {
+		print "$method\t$host\t$ip\tNAK\t$rtt\n";
+		$STATUS = 1;
+	    }
+	} else {
+	    print "$method\t$host\t$ip\tERROR\t$rtt\n";
+	}
+    }
+    $ping->close();
+}
+
+sub port_number($$) {
+    # Validate proto/port. Convert port name to number as needed.
+    my ($proto, $port) = @_;
+    my $result;
+    if ($port =~ /\D/) {
+	$result = getservbyname($port, $proto) or
+	    die("$IDENT: error: Invalid PORT=$port\n$USAGE");
+    } else {
+	$result = $port;	# no-op, already numeric
+    }
+    return $result;
+}
+
+sub tcp_method($@) {
+    my ($port, @hosts) = (@_);
+    my $method = my $proto = "tcp";
+    my $ping = Net::Ping->new($method, $TIMEOUT);
+    $ping->port_number(port_number($proto, $port));
+    $ping->service_check(1);	# require 3-way handshake for ACK
+    $ping->hires(0);		# Avoid Time::Hires, not installed by default
+    for my $host (@hosts) {
+	# If the hostname cannot be found or there is a problem with the IP
+	# number, the success flag returned will be undef. Otherwise, the
+	# success flag will be 1 if the host is reachable and 0 if it is not
+	my ($status, $rtt, $ip) = $ping->ping($host);
+	$rtt = "undef" unless defined $rtt;
+	$ip = "undef" unless defined $ip;
+	if (defined $status) {
+	    if ($status) {
+		print "$method\t$host:$port\t$ip\tACK\t$rtt\n";
+	    } else {
+		print "$method\t$host:$port\t$ip\tNAK\t$rtt\n";
+		$STATUS = 1;
+	    }
+	} else {
+	    print "$method\t$host:$port\t$ip\tERROR\t$rtt\n";
+	}
+    }
+    $ping->close();
+}
+
+sub syn_method($@) {
+    my ($port, @hosts) = (@_);
+    my $method = "syn";		# asynchronous pings/responses for speed
+    my $proto = "tcp";
+    my $ping = Net::Ping->new($method, $TIMEOUT);
+    $ping->port_number(port_number($proto, $port));
+    $ping->service_check(1);	# require 3-way handshake (>SYN,<SYN+ACK,>ACK)
+    $ping->hires(0);		# Avoid Time::Hires, not installed by default
+    my %nak;
+    for my $host (@hosts) {
+	my ($status, $rtt, $ip) = $ping->ping($host);
+	$rtt = "undef" unless defined $rtt;
+	$ip = "undef" unless defined $ip;
+	$nak{$host} = $ip;	# mark it failed until known otherwise
+	if (defined $status and $status) {
+	    ;			# Wait for SYN/ACK ...
+	} else {
+	    $status = "undef" unless defined $status;
+	    warn("$IDENT: debug: host=$host status=$status rtt=$rtt ip=$ip\n");
+	}
+    }
+    while (my ($host, $rtt, $ip) = $ping->ack) {	# Reply ACK to SYN/ACK
+	$rtt = "undef" unless defined $rtt;
+	$ip = "undef" unless defined $ip;
+	print "$method\t$host:$port\t$ip\tACK\t$rtt\n";
+	delete $nak{$host};	# not failed
+    }
+    for my $host (sort keys %nak) {
+	my $ip = $nak{$host};
+	my $reason = $ping->nack($host);
+	$reason = "ERROR" unless defined $reason;
+	print ("$method\t$host:$port\t$ip\tNAK\t",$reason,"\n");
+	$STATUS = 1;
+    }
+    $ping->close();
+}
+
+# main()
+
+do { print $USAGE; exit(0); } if ($ARGV[0] =~ /^-h|--(help|manpage)\Z/);
+
+my $METHOD = shift @ARGV or do {
+    warn("$IDENT: error: Missing METHOD\n$USAGE");
+    exit(2);
+};
+
+print "METHOD\tHOSTNAME:PORT\tIP-ADDRESS\tSTATUS\tRTT|DIAGNOSTIC\n";
+
+for ($METHOD) {
+    ($_ eq "icmp") and do { icmp_method(@ARGV); last; };
+    my $ports = shift @ARGV or die("$IDENT: error: Missing PORTS\n$USAGE");
+    my @ports = split(/,/, $ports);
+    ($_ eq "tcp") and do { tcp_method($_, @ARGV) for @ports; last; };
+    ($_ eq "syn") and do { syn_method($_, @ARGV) for @ports; last; };
+    die("$IDENT: error: Invalid METHOD=$_\n$USAGE");
+}
+
+exit($STATUS);
