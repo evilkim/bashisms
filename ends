@@ -1,0 +1,122 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# HELP - Show both ends (head and tail) of input
+#
+# DESCRIPTION
+#
+# Show the head and tail of input files (or stdin).
+#
+# OPTIONS
+#
+# -h|--help	Print this message.
+#
+# -d|--debug	Enable diagnostic messages.
+#
+# -q|--quiet	Disable informational messages.
+#
+# -v|--verbose	Enable extra informational messages.
+#
+# -N|--number	Number all input lines before output (see cat -n).
+#
+# -n|--lines LINES
+#		Show LINES from head and tail (default: 10).
+#		For convenience, LINES < 10 can be shortened to -LINES.
+#
+# --		Required if the first non-OPTION starts with a '-'.
+#
+# KNOWN ISSUES
+# * Doesn't understand -LINES notation greater that -9
+# * Doesn't handle -n +LINES notation (if that even makes sense here?)
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+IDENT=${0##*/}
+USAGE="$IDENT [OPTIONS] [FILES]"
+
+BINDIR=$(cd $(dirname $0) && pwd)
+source "$BINDIR/logging.sh"
+
+SHORTOPTS=n:N123456789
+LONGOPTS=lines:,number,filename:
+LINES="10"
+_N=""
+
+#source "$BINDIR/getopt.sh"
+# User-specfied OPTIONS with required args unsupported as yet
+#-----------------------------------------------------------------------------#
+# OPTIONS
+# https://gist.github.com/cosimo/3760587
+
+SHORTOPTS=hdqv${SHORTOPTS}
+LONGOPTS=help,debug,quiet,verbose${LONGOPTS:+,}${LONGOPTS}
+
+# Defaults:
+DEBUG=false
+QUIET=false
+VERBOSE=false
+
+getopt --test >/dev/null && { log_error "incompatible getopt(1)"; exit 1; }
+OPTIONS=$(POSIXLY_CORRECT=yes getopt -o $SHORTOPTS --long $LONGOPTS -- "$@")
+if [[ $? != 0 ]]; then log_usage "getopt failed"; fi
+eval set -- $OPTIONS
+
+declare -A GETOPT  # Associative array indicating user-specified options
+
+while [[ "$1" == -* ]]; do
+    log_debug "getopt: [$1]"
+    case "$1" in
+	-h|--help) log_help;;
+	-d|--debug) DEBUG=true;;
+	-q|--quiet) QUIET=true;;
+	-v|--verbose) VERBOSE=true;;
+	--filename) FILENAME="$2"; shift;;			# *THIS IS NEW*
+	-n|--lines) LINES="$2"; shift;;				# *THIS IS NEW*
+	-[1-9]) LINES="${1/-/}";;				# *THIS IS NEW*
+	-N|--number) _N="-n";;					# *THIS IS NEW*
+	--) shift; break;;	# canonical end of options
+	--*)
+	    # user specified LONGOPT
+	    GETOPT[${1/--/}]=true
+	    log_debug "GETOPT[${1/--/}]=${GETOPT[${1/--/}]}"
+	    ;;
+	-*)
+	    # user specified SHORTOPT
+	    GETOPT[${1/-/}]=true
+	    log_debug "GETOPT[${1/-/}]=${GETOPT[${1/-/}]}"
+	    ;;
+	*) break;;		# end of options (notreached?)
+    esac
+    shift
+done
+
+#-----------------------------------------------------------------------------#
+# main()
+
+case $# in 0) set -- -;; esac	# Read stdin
+       
+input="/tmp/$IDENT.$$"
+trap "rm -f $input" EXIT HUP INT TERM
+
+sep=false
+
+for file in $@; do
+    $sep && echo
+    $QUIET || sep=true
+    rm -f "$input"
+    total=$(cat $_N "$file" | tee "$input" | wc -l)  # capture stdin if no FILE
+    double=$((LINES * 2))
+    $QUIET || echo "==> ${FILENAME:-$file} <=="
+    cat "$input" | head ${LINES:+-n $LINES}
+    if [[ $LINES -lt $total ]]; then
+	if [[ $total -lt $double ]]; then
+	    ((LINES = total - LINES))
+	else
+	    skipped=$((total - double))
+	    $QUIET || echo "==> [Skipped $skipped lines] <=="
+	fi
+	cat "$input" | tail ${LINES:+-n $LINES}
+    else
+	log_debug "that's all folks!"
+    fi
+done
