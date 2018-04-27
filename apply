@@ -1,0 +1,964 @@
+#!/usr/bin/perl -w
+
+=head1 NAME
+
+apply - Run COMMAND for each selected HOST
+
+=head1 SYNOPSIS
+
+apply [ I<OPTIONS> ] I<HOSTSELECT> I<COMMAND>
+
+=cut
+
+use strict;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case require_order); # break on /^[^-]/
+use Pod::Usage;
+use File::Temp qw(:POSIX);
+
+my $IDENT = basename($0,".pl");
+my $Debug = 0;
+#my $DefaultTagFile = dirname($0)."/../etc/$IDENT.tags";
+my $RootDir = dirname(dirname($0));
+my $EtcDir = $RootDir."/etc";
+my $DefaultTagFile = $EtcDir."/$IDENT.tags";
+my $DefaultOptions = $EtcDir."/${IDENT}rc";
+my $TagFile = $DefaultTagFile;
+my $ExecTags;
+my $ListTags;
+my $DumpTagFile;
+my $KnownHosts;
+my $Trace = 1;
+my $Verbose;
+my $Xargs;
+my $MapResponse;
+my $StdErr;
+my $Sort = 1;			# Default: Process in sorted order
+my $NoAction;
+my $ReQuote;
+my $PostMortem;
+my $Ignore = 1;			# See $ENV{APPLY_TAGDIR}/apply.ignore
+my $RunXargs = 0;	   # Deprecate auto-xargs/ssh in favor of xssh
+
+#my $NoRC;
+
+sub _GetOptions($) {
+  my ($permittedArgv) = @_;
+
+GetOptions("help|?" => \&pod2usage,
+	   "manpage" => sub { pod2usage(-verbose => 3) },
+	   "ignore!" => \$Ignore,
+#	   "norc" => sub {
+#	     $NoRC++;
+#	     $ENV{APPLYRC} = "/dev/null"; # vs? delete $ENV{APPLYRC};
+#	   },
+	   "nodebug" => sub { $Debug = 0; },
+	   "debug|d" => sub {
+	     $Debug++;
+	     if ($ReQuote) {
+	       $ReQuote .= ",debug";
+	     }
+	     else {
+	       $ReQuote = "debug";
+	     }
+	   },
+	   "Debug|D=i" => sub {
+	     if ($Debug = $_[1]) {
+	       if ($ReQuote) {
+		 $ReQuote .= ",debug";
+	       }
+	       else {
+		 $ReQuote = "debug";
+	       }
+	     }
+	   },
+	   "tagfile|f=s" => \$TagFile,
+	   "known-hosts" => \$KnownHosts,
+	   "exec|X!" => \$ExecTags,
+	   "list-tags|l" => \$ListTags,
+	   "dump-tagfile|L" => \$DumpTagFile,
+	   "sort!" => \$Sort,
+	   "S" => sub { undef $Sort }, # == --nosort
+	   "noaction|n" => \$NoAction,
+	   "run-xargs" => \$RunXargs,
+	   "quiet" => sub { undef $Trace; }, # == --notrace
+	   "trace|t!" => \$Trace,
+	   "verbose" => \$Verbose,
+           "xargs" => \$Xargs,
+	   "map-response|1" => sub {
+	     $MapResponse++;
+	     if ($ReQuote) {
+	       if ($ReQuote eq "debug") {
+		 $ReQuote = "quotemeta,debug";
+	       }
+	     }
+	     else {
+	       $ReQuote = "quotemeta";
+	     }
+	   },
+	   "nomap-response" => sub { undef $MapResponse; },
+	   "stderr|2" => \$StdErr,
+	   "requote=s" => \$ReQuote,
+	   "Q" => sub { $ReQuote = "quotemeta"; }, # == --requote=quotemeta
+	   "postmortem!" => \$PostMortem,
+	   )
+    or pod2usage(2);
+  # fatal as of 2017-02-28
+  die("$IDENT: No ARGV permitted in options files!\n")
+      if (@ARGV and !$permittedArgv);
+}
+
+#unless ($NoRC) {
+  # Default options ('Run Commands')
+  #  
+  my $ApplyRC = (exists $ENV{APPLYRC}
+		 ? $ENV{APPLYRC}	# Override defaults
+		 : "$EtcDir/applyrc:$ENV{HOME}/.applyrc"); # Defaults
+  
+  for my $applyRC (split(/:/,$ApplyRC)) {
+    if (open(RC,$applyRC)) {
+      local @ARGV = (grep { /\S/; } 
+		     map {
+		       s/\s*\#.*//;
+		       $_;
+		     }
+		     <RC>);	# One option per line, (ignore comments)
+      close(RC);
+      chomp(@ARGV);
+      _GetOptions(0);		# disallow trailing @ARGV
+    }
+    #else {
+    #  warn("$IDENT: Error in open($applyRC): $!\n") if $Debug;
+    #}
+  }
+#}
+
+#warn("Debug=$Debug\n");
+
+_GetOptions(1);			# allow trailing @ARGV
+
+#warn("Debug=$Debug\n");
+
+unless (exists $ENV{APPLY_ETCDIR}) {
+  $ENV{APPLY_ETCDIR} = $EtcDir; # For use in #!EXEC
+}
+
+unless (exists $ENV{APPLY_TAGDIR}) {
+  $ENV{APPLY_TAGDIR} = dirname($TagFile); # For use in #!EXEC
+}
+
+my %TagFile = ();		# TAG => { exec => $RHS, tags => TAG[,TAG]... }
+my %Tags = (null => []);
+my @Included;
+
+sub LoadTagFile($);
+sub LoadTagFile($) {
+  my ($tagFile) = @_;
+  push(@Included,$tagFile);
+  my $TAGFILE;
+  if (open($TAGFILE,$tagFile)) {
+    warn("LoadTagFile($tagFile)\n") if ($Debug and $DumpTagFile);
+    while (<$TAGFILE>) {
+      my $line = $_;
+      chomp;
+      s/^\s+//;
+      s/\s+$//;
+      my $include = "";
+      if ($line =~ /^\#include ([<\"].+?[\">])/) {
+	$include = $1;
+	if ($include =~ s/^\<(.+)\>/$1/) {
+	  # path is relative to the standard (default) tagfile
+	  $include = dirname($DefaultTagFile)."/".$include
+	      unless ($include =~ qr(^/)); # path is absolute
+	}
+	elsif ($include =~ s/^\"(.+)\"/$1/) {
+	  # path is relative to the current tagfile
+	  $include = dirname($tagFile)."/".$include
+	      unless ($include =~ qr(^/)); # path is absolute
+	}
+	else {
+	  # fatal as of 2017-02-28
+	  die("$IDENT: $tagFile, line $.: malformed include: $include!\n");
+	  undef $include;
+	}
+	if ($include and grep { $include eq $_ } @Included) {
+	  warn("$IDENT: $tagFile, line $.: duplicate include: $include!\n");
+	  undef $include;
+	}
+      }
+      print $line if ($DumpTagFile);
+      LoadTagFile($include) if $include;
+      next if ($DumpTagFile);
+      
+      if ($line =~ /^[@](\S+)\s+(.+)/) {
+	my ($tag,$rhs) = ($1,$2);
+	if ($rhs =~ s/^\#!(\S+)/$1/) {
+	  $TagFile{$tag}->{exec} = $rhs;
+	}
+	else {
+	  $rhs =~ s/\s*\#.*//;	# remove trailing comments
+	  my @rhs = split(/[\s,]+/,$rhs);
+	  for my $token (@rhs) {
+	    if ($token =~ s/^[@](\S+)/$1/) {
+	      push(@{ $TagFile{$tag}->{tags} ||= [] },$token); # delayed expand
+	    }
+	    else {
+	      push(@{ $Tags{$tag} ||= [] },$token); # simple name
+	    }
+	  }
+	}
+      }
+      else {
+	next if ($line =~ /^\#/); # ignore full line comments
+	next unless ($line =~ /\S/); # ignore blank lines
+	# fatal as of 2017-02-28
+	die("$IDENT: $tagFile, line $., bad entry: $line\n");
+      }
+    }
+    close($TAGFILE) or warn("$IDENT: Error in close($tagFile): $!\n");
+  }
+  else {
+    # fatal as of 2017-02-28
+    die("$IDENT: Error in open($tagFile): $!\n");
+  }
+}
+
+LoadTagFile($TagFile);
+
+exit if $DumpTagFile;
+
+my @AllTags = do {
+  my %seen = (null => 1);	# @all -@null
+  grep { ! $seen{$_}++ } (keys %TagFile,keys %Tags);
+};
+
+if ($ListTags) {
+  print STDOUT ("\@$_\n") for @AllTags;
+  exit(0);
+}
+
+#my %TagExpanded;
+
+sub ExpandTag($);		# recursion!
+sub ExpandTag($) {
+  my ($tag) = @_;
+  my @result;
+  warn("ExpandTag(@_)\n") if $Debug;
+  if (exists $TagFile{$tag}) {
+    #warn("$tag: remove entry from tagfile\n");
+    my $entry = delete $TagFile{$tag};
+    #$TagExpanded{$tag}++;
+    if (my $exec = $entry->{exec}) {
+      #warn("$tag: remove exec from entry\n");
+      delete $entry->{exec};
+      # $exec =~ s/^(apply)\b/$1 -f $TagFile if ($TagFile ne $DefaultTagFile);
+      $exec =~ s/^(apply)\b/$1 -D $Debug/;
+      if ($ExecTags) {
+	warn("$tag: exec($exec)\n") if $Debug;
+	push(@{ $Tags{$tag} ||= [] },split(/\s+/,qx($exec)));
+      }
+      else {
+	warn("$tag: skip($exec)\n") if $Debug;
+	push(@{ $Tags{$tag} ||= [] },());
+      }
+    }
+    if (exists $entry->{tags}) {
+      my @tags = @{ $entry->{tags} };
+      #warn("$tag: remove tags from entry\n");
+      delete $entry->{tags};
+      push(@{ $Tags{$tag} ||= [] },ExpandTag($_)) for @tags;
+    }
+  }
+  if (exists $Tags{$tag}) {
+    push(@result,@{ $Tags{$tag} });
+  }
+  else {
+    die("$IDENT: \@$tag: No such tag\n");  # fatal as of 2017-02-28
+    # unless $TagExpanded{$tag}; # <= entry == @null?
+  }
+  return(@result);
+}
+
+my @HOSTSPECS = do {
+  if (@ARGV) {
+    if ($ARGV[0] eq "-") {
+      shift @ARGV;
+      my @hostspecs = <STDIN>;
+      chomp(@hostspecs);
+      @hostspecs;
+    }
+    else {
+      shift @ARGV;
+    }
+  }
+  else {
+    my @hostspecs = <STDIN>;
+    chomp(@hostspecs);
+    @hostspecs;
+  }
+};
+
+my @EXCLUDE = ();
+
+if ($Ignore) {
+  push(@EXCLUDE,q(@APPLY_IGNORE));
+}
+
+my @ALLOW = ();
+
+if ($KnownHosts) {
+  my $knownHosts = "$ENV{HOME}/.ssh/known_hosts";
+  if (open(KNOWN,$knownHosts)) {
+    my @knownHosts = ();
+    while (<KNOWN>) {
+      chomp;
+      s/\#.*//;
+      next unless /^(\S+)\s+.+/;
+      my $knownHost = $1;
+      $knownHost =~ s/,.*//;	# Entries are HOSTNAME,IPADDR or IPADDR
+      push(@knownHosts,$knownHost);
+    }
+    close(KNOWN) or warn("$IDENT: Error in close($knownHosts): $!\n");
+    push(@ALLOW,join(",",@knownHosts));
+  }
+  else {
+    # fatal as of 2017-02-28
+    die("$IDENT: Error in open($knownHosts): $!\n");
+  }
+}
+
+# Manually process any -EXCLUDE and +ALLOW modifiers.
+# (This is why we use Getopt::Long qw(require_order)
+
+while (@ARGV) {
+  local $_ = shift @ARGV;
+  /^[-](\S+)/ and do {
+    push(@EXCLUDE,$1);
+    next;
+  };
+  /^[+](\S+)/ and do {
+    push(@ALLOW,$1);
+    next;
+  };
+  unshift(@ARGV,$_);
+  last;
+}
+
+my @COMMAND = @ARGV;
+
+# autoflush
+select STDERR; $|++;
+select STDOUT; $|++;
+
+sub ReadCommand {
+  my $result;
+  my @result;
+  print STDERR ("${IDENT}\>") if -t STDERR;
+  while (my $command = <STDIN>) {
+    chomp $command;
+    push(@result,($command =~ /\S/ ? $command : ())); # ignore blank lines
+    print STDERR ("${IDENT}\>") if -t STDERR;
+  }
+  $result = join("\n",@result);
+  warn("$IDENT: info: ReadCommand: result($result)\n");
+  return $result;
+}
+
+if ("@COMMAND" eq "-") {
+  @COMMAND = ReadCommand();
+  if ("@COMMAND" eq "-") {
+    @COMMAND = ();		# just list selected HOSTS to STDOUT
+  }
+}
+if (@COMMAND) {
+  if ($Debug) {
+    warn("$IDENT: No {} placeholders in COMMAND\n")
+	unless (grep { $_ =~ /[{][}]/ } @COMMAND);
+  }
+}
+
+print STDERR ("command(@COMMAND)\n") if $Debug;
+
+sub ExpandHostSpecs($@) {
+  my ($debug,@hostspecs) = @_;
+  my @result = ();
+  for my $hostspec (@hostspecs) {
+    warn("$debug($hostspec)\n") if $Debug>1;
+    for my $token (split(/,/,$hostspec)) {
+      warn("token($token)\n") if $Debug>3;
+      if ($token =~ s/^[@](\S+)$/$1/) {
+	next if ($token eq "null");
+	if ($token eq "all") {
+	  push(@result,(map { ExpandTag($_) } @AllTags));
+	}
+	else {
+	  push(@result,ExpandTag($token));
+	}
+      }
+      else {
+	push(@result,$token);	# simple hostname
+      }
+    }    
+  }
+  my %seen;			# eliminate duplicates
+  @result = (grep { ! $seen{$_}++ } @result);
+  warn("$debug result: ",join(",",@result),"\n") if $Debug>3;
+  return @result;
+}
+
+# Takes two array references. Returns a list of elements in the first
+# array that aren't in the second.
+#
+# See setminus from <URL:rosettacode.org/wiki/Symmetric_difference>
+#
+# N.B: Does not sort -- Preserves order of elements!
+#
+sub SetSubtract($$) {
+  my ($a,$b) = @_;
+  my @result = ();
+  
+  # Convert $b to a hash, so it's easier to search.
+  my %b;
+  @b{@$b} = ();
+  
+  @result = grep { not exists $b{$_} } @$a;
+  
+# Equivalently, presumably slower:
+#  for my $element (@$a) {
+#    unless (grep { $element eq $_ } @$b) {
+#      push(@result,$element) unless grep { $element eq $_ } @result;
+#    }
+#    else {
+#      warn("SetSubtract: Excluding: $element\n") if $Debug;
+#    }
+#  }
+  
+  return(@result);
+}
+
+# Takes two array references. Returns a list of elements in both arrays.
+#
+# N.B: Does not sort -- Preserves order of elements!
+#
+sub SetIntersect($$$) {
+  my ($debug,$a,$b) = @_;
+  my @result = ();
+  my @difference = ();
+  for my $element (@$a) {
+    if (grep { $element eq $_ } @$b) {
+      push(@result,$element) unless grep { $element eq $_ } @result;
+      warn("SetIntersect($debug): include($element)\n") if $Debug>1;
+    }
+    elsif ($Debug>1) {
+      unless (grep { $element eq $_ } @difference) {
+	push(@difference,$element);
+	warn("SetIntersect($debug): exclude($element)\n");
+      }
+    }
+  }
+  return(@result);
+}
+
+my @Hosts = ExpandHostSpecs("addhost",@HOSTSPECS);
+
+my @Exclude = ExpandHostSpecs("exclude",@EXCLUDE);
+@Hosts = SetSubtract(\@Hosts,\@Exclude);
+
+for (@ALLOW) {
+  my @allow = ExpandHostSpecs("allow",$_);
+  @Hosts = SetIntersect($_,\@Hosts,\@allow);
+}
+
+@Hosts = sort @Hosts if $Sort;
+
+sub PostMortem($) {
+  my ($status) = @_;
+  my $exited = $status >> 8;
+  my $signal = $status & 127;
+  my $dumped = $status & 128;
+  my $result = "died";
+  $result .= " with exit value $exited" if $exited;
+  $result .= " on signal $signal" if $signal;
+  $result .= " with core dump" if $dumped;
+  return $result;
+}
+
+sub Xargs($@) {
+  my ($command,@hosts) = @_;
+  my $xargs = join(" ",qw(| xargs -i),($Trace ? "-t" : ""),$command);
+  warn("command($xargs)\n") if $Debug;
+  unless ($NoAction) {
+    if (open(XARGS,$xargs)) {
+      print XARGS ("$_\n") for @hosts;
+      close(XARGS) or do {
+	warn("$IDENT: Error in close($xargs): ",PostMortem($?),"\n") if $?;
+      };
+    }
+    else {
+      # fatal as of 2017-02-28
+      die("$IDENT: Error in open($xargs): $!\n");
+    }
+  }
+}
+
+# Following inspired from inspection of the Sysadm::Install sources...
+# ... escape various of:
+#
+# !	exclamation points, a/k/a bangs
+# "	double quotes
+# '	single quotes, a/k/a ticks
+# \	backslashes
+# \s+	embedded whitespace
+# `	grave accents, a/k/a backticks
+# |	vertical bars, a/k/a pipes
+#
+# But how and and when and which or all?
+
+sub rq_qquote(@) {
+  my($result) = @_;
+  $result =~ s/([\\""])/\\$1/g;
+  my $metas = '!$`';
+  $result =~ s/([$metas])/\\$1/g;
+  return "\"$result\"";
+}
+
+sub rq_quote(@) {
+  my($result) = @_;
+  $result =~ s/([\\])/\\$1/g;
+  $result =~ s/([''])/'\\$1'/g;
+  return "\'$result\'";
+}
+
+sub rq_debug($@) {
+  my ($label,@argv) = @_;
+  my $i = 0;
+  for (@argv) {
+    print STDERR ($label."[$i]($_)\n");	# Do not print to STDOUT!
+    $i++;
+  }
+}
+
+sub ReQuote(@) {
+  my @requote = split(/,/,$ReQuote);
+  my @result = @_;
+  for (@requote) {
+    /^debug$/ and do { rq_debug("$IDENT: \$command",@result); next; };
+    /^quotemeta$/ and do { @result = map { quotemeta($_); } @result; next; };
+    /^qquote$/ and do { @result = map { rq_qquote($_); } @result; next; };
+    /^quote$/ and do { @result = map { rq_quote($_); } @result; next; };
+    /^none$/ and next;
+    die("$IDENT: $_: No such requoter\n");
+  }
+  return @result;
+}
+
+my %Response;
+
+if (@COMMAND and $RunXargs) {
+  my $i = 0;
+  if ($Xargs) {
+    Xargs("@COMMAND",@Hosts);
+  }
+  else {
+    print STDERR ("$IDENT: COMMAND=@COMMAND\n") if ($Trace and $Verbose);
+    my $sep = "$IDENT: ";
+    for my $host (@Hosts) {
+      if ($MapResponse) {
+	print STDERR ($sep.$host) if $Trace;
+	$sep = "," unless $Debug;
+      }
+      unless ($NoAction) {
+	my @response;
+	my @command = @COMMAND;
+	@command = map { s/{}/${host}/g; $_; } @command;
+	@command = ReQuote(@command) if $ReQuote;
+	push(@command,"2>&1") if $StdErr;
+	
+	if ($MapResponse) {
+	  if ($Debug) {
+	    warn("\n") if ($Trace);
+	    warn("qx(@command)\n");
+	  }
+	  @response = qx(@command); # EXEC COMMAND HERE
+	  warn("$IDENT: Error in qx(@command): ",PostMortem($?),"\n")
+	      if ($PostMortem and $?);
+	  push(@{ $Response{join("",@response)} ||= [] },$host);
+	}
+	else {
+	  if ($Trace) {
+	    if ($Verbose) {
+	      print STDERR ("$IDENT: host=$host command=@command\n");
+	    }
+	    else {
+	      print STDERR ("$IDENT: host=$host\n");
+	    }
+	  }
+	  if ($Debug) {
+	    warn("system(",(map { "($_)" } @command),")\n");
+	  }
+	  (0 == system(@command)) or do { # EXEC COMMAND HERE
+	    warn("$IDENT: Error in system(@command): ",PostMortem($?),"\n")
+		if ($PostMortem and $?);
+	  };
+	}
+      }
+    }
+    if ($MapResponse) {
+      print STDERR ("\n") if $Trace;
+      my $nResponse = "response00";
+      
+      # Generate hostspecs that can re-select common responders (maybe more)...
+      # ...if --verbose (trigger instead with new option --autospec=TEMPLATE?)
+      my $nAutoSpec = "autospec00";
+      my %autoSpecs = ("" => $nAutoSpec." ".
+		       "\@null \# No common tags among these responders");
+      
+      for (sort keys %Response) {
+	my @responders = @{ $Response{$_} };
+	my @commonTags = ();
+	if ($Verbose) {
+	  # Show tags that these responders are all members of...
+	  for my $tag (@AllTags) {
+	    my @tagHosts = ExpandTag($tag);
+	    if (@responders == SetIntersect($tag,\@responders,\@tagHosts)) {
+	      push(@commonTags,$tag);
+	    }
+	  }
+	}
+	$nResponse++;
+	print STDOUT ("\n","\@$nResponse ",join(",",@responders),"\n");
+	
+	if ($Verbose) {
+	  my $commonTags = "@commonTags";
+	  unless (grep { $_ eq $commonTags } keys %autoSpecs) {
+	    $nAutoSpec++;
+	    my $autoSpec = q(@).shift @commonTags;
+	    if (@commonTags) {
+	      $autoSpec = q(@).$nAutoSpec.
+		  " #!$IDENT --exec $autoSpec ".
+		  join(" ",map { q(+@).$_ } @commonTags); # computed
+	    }
+	    else {
+	      $autoSpec = $nAutoSpec." ".$autoSpec; # keep it simple
+	    }
+	    $autoSpecs{$commonTags} = $autoSpec;
+	  }
+	  print STDOUT ($autoSpecs{$commonTags},"\n");
+	}
+	
+	print STDOUT ($_);	# COMMAND RESPONSE HERE
+      }
+    }
+  }
+} else {
+    # Skip xargs and just print the list of hosts...
+    die("$IDENT: error: COMMAND (@COMMAND) is deprecated. See --run-xargs.\n")
+	if @COMMAND;
+    print STDOUT ("$_\n") for @Hosts;
+}
+
+exit;
+
+__END__
+
+=pod
+
+=head1 DESCRIPTION
+
+Print list of hosts derived from I<HOSTSELECT>.
+
+*DEPRECATED* Run I<COMMAND> across the set of hosts specified by
+I<HOSTSELECT> rather like using B<xargs -i> I<COMMAND>.  See
+examples (which now assume the --run-xargs option.)
+
+I<HOSTSELECT> ::= { "-" | I<HOSTSPECS> } [ {"+"|"-"} I<HOSTSPECS> ]...
+
+I<HOSTSPECS> ::= I<HOSTSPEC> [ "," I<HOSTSPEC> ]...
+
+I<HOSTSPEC> ::= { I<HOST> | "@" I<TAG> }
+
+The initial argument is required to establish a working set of hosts.
+
+If the initial argument is missing or "-", the working set of hosts
+is read from STDIN.
+
+Subsequent modifiers specify a set of hosts excluded from or allowed in the
+working set.
+
+Each modifier specified by "-"I<HOSTSPECS> excludes
+that set of hosts from the current working set.
+
+Each modifier specified by "+"I<HOSTSPECS> allows that set of hosts
+found in the intersection with the current working set.
+
+The list of valid I<TAG>s is found in I<TAGFILE> (see --tagfile).
+
+=head1 OPTIONS
+
+=item B<--help>
+
+=over 4
+
+Print brief help message.
+
+=back
+
+=item B<--manpage>
+
+=over 4
+
+Print this manpage.
+
+=back
+
+=item B<--debug> I<level>
+
+=over 4
+
+Print debug messages. More for higher I<level>.
+
+=back
+
+=item B<--exec> or B<-X>
+
+=over 4
+
+Enable experimental I<TAG>s for I<ENTRY>s with "#!" I<COMMANDLINE> on I<RHS>.
+
+The value of the I<TAG> expands to the STDOUT from running I<COMMANDLINE>.
+
+Example:
+
+    @my-servers #!cat $HOME/.my-servers
+
+=back
+
+=item B<--list-tags> or B<-l>
+
+=over 4
+
+Print available tags and exit.
+
+=back
+
+=item B<--dump-tags> or B<-L>
+
+=over 4
+
+Print I<TAGFILE> and exit.
+
+=back
+
+=item B<--tagfile> or B<-f> I<TAGFILE>
+
+=over 4
+
+Use I<TAGFILE> instead of the default (I<RootDir>/etc/apply.tags where I<RootDir> is ".." relative to the directory where B<apply> is installed.)
+
+Format of I<TAGFILE> is:
+
+I<ENTRY> ::= "@" I<TAG> I<SP> I<RHS>
+
+	-- One ENTRY per line.
+	-- No line continuations, but the value of matching TAGs accumulate.
+
+I<TAG> ::= I<NAME>
+
+I<RHS> ::= ( I<TOKENLIST> )* [ I<EXEC> ]
+
+I<TOKENLIST> ::= I<TOKEN> ( I<SEP> I<TOKEN> )*
+
+I<EXEC> ::= "#!" I<COMMANDLINE> -- See the --exec option.
+
+I<TOKEN> ::= { I<HOST> | "@" I<TAG> }
+
+I<HOST> ::= I<NAME>
+
+I<NAME> ::= qr/[^\s,]+/
+
+	-- Any string of non-whitespace not including ","
+
+I<SEP> ::= ( <SP> | "," )
+
+I<SP> ::= qr/\s+/
+
+The special I<TAG> "null" expands to the empty set.
+This can be used to create an entry that reserves a I<TAG> with no current
+value, e.g:
+
+	@reserved @null
+
+The special I<TAG> "all" expands to the universal set of HOSTs.
+
+=back
+
+=item B<--quiet>
+
+=over 4
+
+Equivalent to --notrace.
+
+=back
+
+=item B<--[no]trace>
+
+=over 4
+
+Show (do not show) progress as commands are executed.
+
+Default: --trace.
+
+=back
+
+=item B<--xargs>
+
+=over 4
+
+Run B<xargs -i> I<COMMAND> directly. Ignored unless --run-xargs in effect.
+
+If --trace in effect, add the B<-t> option.
+
+Default: Emulate xargs(1L) using a built-in equivalent.
+
+=back
+
+=item B<--verbose>
+
+=over 4
+
+Be chattier.
+
+=back
+
+=item B<--map-response>
+
+=over 4
+
+Group like responses from multiple hosts into a single stanza.
+
+If B<--verbose> in effect, also shows a generated I<ENTRY> constructed
+from all the B<TAG>s the responding hosts have in common.
+
+=back
+
+=item B<--stderr>
+
+=over 4
+
+Include stderr in responses. Implies I<COMMAND> "2>&1"
+
+N.B: Order of stdout/stderr can be unpredictable.
+
+=back
+
+=item B<--known-hosts>
+
+=over 4
+
+Ignore hosts not listed in ~/.ssh/known_hosts.
+
+=back
+
+=item B<--nosort> or B<-S>
+
+=over 4
+
+Preserve sort order of hosts from the command line/tagfile.
+
+=back
+
+=item B<--noaction> or B<-n>
+
+=over 4
+
+Do not execute I<COMMAND>.  Just validates options and arguments.
+
+=back
+
+=item B<--run-xargs>
+
+=over 4
+
+Run I<COMMAND> with xargs (or the built-in equivalent.) This was the
+original default and primary purpose of this tool.  See instead xssh.
+
+=back
+
+=head1 EXAMPLES
+
+Example I<HOSTSELECT>:
+
+    $ apply h1,h2,h3,h4,h5 -h2,h3 -h4,h5
+    h1
+
+    $ apply h1,h2,h3,h4,h5 +h1,h2 +h2,h3
+    h2
+
+    $ apply h1,h2,h3,h4,h5 -h1,h2 +h2,h3
+    h3
+
+    $ apply @all|wc
+        316     316    2759
+
+    $ apply @all +@null|wc
+          0       0       0
+
+    $ apply @all +@all|wc
+        316     316    2759
+
+    $ apply @all -@all|wc
+          0       0       0
+
+=head1 ENVIRONMENT
+
+=over 4
+
+=item APPLY_ETCDIR
+
+For use in I<EXEC> entries (see B<--exec>).  Set to the directory
+containing I<TAGFILE> (see B<--tagfile>) unless inherited.
+
+=item APPLYRC
+
+Colon (:) separated list of files from which to preload options.
+
+Default: I<RootDir>/etc/applyrc:${HOME}/.applyrc
+
+Where: I<RootDir> is ".." (relative to the directory where apply is installed.)
+
+Missing files are silently ignored.
+
+Options are one per line with optional comments (#.*) removed.
+
+Options appearing in subsequent files and those on the command line override
+earlier options.
+
+=back
+
+=head1 SEE ALSO
+
+=over 4
+
+=item apply2map
+
+=item applymapper
+
+=item apply-mktags
+
+=item apply-discover-tags
+
+=item massh
+
+=back
+
+=head1 KNOWN ISSUES
+
+=over 4
+
+=item Options with values in files must use --option=value vs. --option value
+
+=item Unable to implement --norc.  Use env APPLYRC=/dev/null as needed.
+
+=back
+
+=cut
