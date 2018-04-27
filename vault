@@ -1,0 +1,301 @@
+#!/bin/bash
+#-----------------------------------------------------------------------------#
+# HELP - Manage an encrypted VAULT of passwords
+#
+USAGE="${IDENT:=${0##*/}} [OPTIONS] ACTION [ARGS]"
+#
+# vault [OPTIONS] get UPN
+#
+# vault [OPTIONS] set UPN PASS
+#
+# vault [OPTIONS] forget UPN
+#
+# DESCRIPTION
+#
+# Manage an encrypted VAULT of passwords.
+#
+# VAULT is formatted as defined by netrc(5) except,
+# * Entries must be defined on a single line (no new-lines permitted), and
+# * Comments are defined as lines beginning with the '#' character.
+#
+# VAULT must end with '.gpg' or it will be appended.
+#
+# On every write to VAULT:
+# * Backup existing VAULT, and
+# * Append comment describing the action, and
+# * Set permissions to 600 (u=rw,go=).
+#
+# N.B. The RHEL curl(1) command does not support the 'default' token defined
+# by netrc(5).
+#
+# ACTIONS
+#
+# * create, init, make, new, touch
+#   Create a new VAULT. Returns an error if it already exists.
+#
+# * set, add
+#   Set the password for the 1st matching UPN or adds an entry if missing.
+#
+# * get
+#   Reveals the password of the 1st matching UPN in plain text.
+#
+# * forget, unset
+#   Removes an entry for the 1st matching UPN.
+#
+# * exists, check
+#   Returns pass ($?==0) if VAULT exists, fail ($?==1) otherwise.
+#
+# * destroy
+#   Removes VAULT after backing it up.
+#
+# * list, ls
+#   Shows a list of UPN in VAULT with passwords scrubbed.
+#
+# * read, dump
+#   Reveals all entries in VAULT in plain text!
+#
+# OPTIONS
+#
+# -h|--help	Print HELP and USAGE lines, suggest --manpage, and exit.
+#
+# --manpage	Print this message and exit.
+#
+# -d|--debug	Enable diagnostic messages.
+#
+# -q|--quiet	Disable informational messages.
+#
+# -v|--verbose	Enable extra informational messages.
+#
+# -W|--no-warnings
+#		Suppress warning messages.
+#
+# --		Required if the first non-OPTION starts with a '-'.
+#
+# -g|--gpg GPG_PROG
+GPG_PROG=${GPG_PROG:-gpg2}
+#		Run GPG_PROG instead of the default.
+#	Examples:
+#	* --gpg "ssh HOSTNAME gpg2"
+#	* --gpg "ssh HOSTNAME source .gpg-agent-info;export GPG_AGENT_INFO;gpg2"
+#		Runs gpg2 over SSH on HOSTNAME when not available
+#		locally (e.g. on Cygwin). The 1st example assumes
+#		HOSTNAME/.bashrc takes care of setting
+#		GPG_AGENT_INFO. Both require gpg-agent to be running
+#		on HOSTNAME.
+#		TESTME: Would ssh -t handle gpg-agent-start and/or pinentry?
+#
+# -V|--vault VAULT
+VAULT="${VAULT:-${HOME}/.netrc.gpg}"
+#		Manage VAULT instead of the default.
+#		VAULT ::= (VAULT_HOST ':')? (VAULT_FILE)?
+#		VAULT_HOST	/* vc: Accessible over SSH. */
+#		VAULT_FILE	/* Default: ${HOME}/.netrc.gpg. */
+#
+# SEE ALSO
+# * gpg-agent
+
+#-----------------------------------------------------------------------------#
+# INIT
+
+# See https://coderwall.com/p/fkfaqq/safer-bash-scripts-with-set-euxo-pipefail
+set -euo pipefail
+
+BINDIR=$(cd $(dirname $0) && pwd)
+
+SHORTDATE=$(date -I)
+LONGDATE=$(date --rfc-3339=seconds)
+
+#-----------------------------------------------------------------------------#
+# OPTIONS
+
+PATH="$BINDIR:$PATH"\
+    GETOPT_SHORT=g:V:\
+    GETOPT_LONG=gpg-prog:,vault:\
+    source getopt.sh || exit
+
+if $DEBUG; then _debug=-debug; fi
+if $QUIET; then _quiet=-quiet; fi
+
+GPG_PROG=${GETOPT[gpg-prog]:-${GETOPT[g]:-${GPG_PROG}}}
+VAULT=${GETOPT[vault]:-${GETOPT[V]:-${VAULT}}}
+[[ ${VAULT##*.} == gpg ]] || VAULT+='.gpg'	# Enforce convention
+VAULT_HOST=${VAULT%:*}
+VAULT_FILE=${VAULT#*:}
+
+#-----------------------------------------------------------------------------#
+# FUNCTIONS
+
+function xtrace { ($XTRACE; "$@") 2> >(log_stderr "${IDENT}: ${FUNCNAME}"); }
+
+function _netrc { xtrace netrc ${_debug:-} ${_quiet:-} ${1:+"$@"}; }
+
+# TODO: Set TERM=vt102 in whichever procees is running pinentry-curses?
+# Broken termcap on RHEL6 for TERM=screen?
+
+function _gpg {
+    local quiet=""; $VERBOSE || quiet=--quiet
+    xtrace ${GPG_PROG} --no-options --no-tty --batch $quiet ${1:+"$@"}
+}
+function decrypt { _gpg --decrypt ${1:+"$@"}; }
+function encrypt { _gpg --encrypt --default-recipient-self ${1:+"$@"}; }
+function _ssh { xtrace ssh ${1:+"$@"}; }
+
+function vault_write {
+    # [ssh VAULT_HOST] mv --backup=numbered VAULT_FILE{,.DATE}
+    # [ssh VAULT_HOST] cat > VAULT_FILE
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) log_usage "${FUNCNAME}: Missing REASON";;
+	*) local reason="# ${LONGDATE} ${*}";;
+    esac
+    # Ignore if save fails (assume creating)
+    local mv="mv --backup=numbered"
+    local save="test -r ${VAULT_FILE} && "
+    save+="${mv} ${VAULT_FILE} ${VAULT_FILE}.${SHORTDATE}"
+    local write="cat > ${VAULT_FILE} && chmod 600 ${VAULT_FILE}"
+    (cat; echo "$reason") |
+    encrypt |
+	case "$VAULT" in
+	    *:*) _ssh "$VAULT_HOST" "${save}; ${write}";;
+	    *)       xtrace bash -c "${save}; ${write}";;
+	esac
+}
+
+function vault_read {
+    # [ssh VAULT_HOST] cat VAULT_FILE
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) ;;
+	*) log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    local read="cat ${VAULT_FILE}"
+    case "$VAULT" in
+	*:*) _ssh "$VAULT_HOST" "${read}";;
+	*)                xtrace ${read};;
+    esac |
+	decrypt
+}
+
+function vault_exists {
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) ;;
+	*) log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    local exists="test -r ${VAULT_FILE}"
+    case "$VAULT" in
+	*:*) _ssh "$VAULT_HOST" "${exists}";;
+	*)                xtrace ${exists};;
+    esac
+}
+
+function vault_list {
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) ;;
+	*) log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    vault_read |
+	perl -lpe 's/^\s*((machine|default)\s.*\spassword)\s.*/${1}/i'
+}
+
+function vault_create {
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) ;;
+	*) log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    if vault_exists; then
+	log_fatal 1 "${FUNCNAME}: ${VAULT} already exists"
+    else
+	cat /dev/null | vault_write "${FUNCNAME}"
+    fi
+}
+
+function vault_get {
+    local args=(${1:+"$@"})
+    local host upn
+    case "${#args[@]}" in
+	0) log_usage "${FUNCNAME} Missing UPN";;
+	1) upn="$1"; shift;;
+	*) shift; log_usage "${FUNCNAME} Too many args: $*";;
+    esac
+    vault_read | _netrc get "$upn" |
+	if ! grep .; then
+	    log_warning "${FUNCNAME}: ${upn}: No matching entry"
+	    false		# set $?=1 if no match is found
+	fi
+}
+
+function vault_set {
+    local args=(${1:+"$@"})
+    local upn
+    case "${#args[@]}" in
+	0) log_usage "${FUNCTION}: Missing UPN";;
+	1)
+	    upn="$1"; shift
+	    # No PASSWORD, try prompting via tty
+	    tty -s || log_usage "${FUNANAME}: Missing PASSWORD (no tty)"
+	    if read -s -p "${upn}'s password: " password; then
+		echo >&2
+	    else
+		echo >&2
+		log_fatal $? "${FUNCNAME}: Cannot read password"
+	    fi
+	    ;;
+	2) upn="$1"; password="$2"; shift 2;;
+	3) shift 2; log_usage "set: Too many args: $*";;
+    esac
+    vault_read | _netrc set "$upn" "$password" |
+	vault_write "${FUNCNAME}: ${upn}"
+}
+
+function vault_forget {
+    local args=(${1:+"$@"})
+    local upn
+    case "${#args[@]}" in
+	0) log_usage "${FUNCNAME}: Missing UPN";;
+	1) upn="$1"; shift;;
+	*) shift; log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    vault_read | _netrc forget "$upn" |	vault_write "${FUNCNAME}: ${upn}"
+}
+
+function vault_destroy {
+    # N.B. As implied, this destroys the VAULT! Implemented for test_vault.
+    # TODO: Add a prompt for confirmation?
+    local args=(${1:+"$@"})
+    case "${#args[@]}" in
+	0) ;;
+	*) log_usage "${FUNCNAME}: Too many args: $*";;
+    esac
+    local mv="mv --backup=numbered"
+    # Ignore if no such file
+    local destroy="${mv} ${VAULT_FILE} ${VAULT_FILE}.${SHORTDATE} || true"
+    case "$VAULT" in
+	*:*) _ssh "$VAULT_HOST" "${destroy}";;
+	*)       xtrace bash -c "${destroy}";;
+    esac
+}
+
+#-----------------------------------------------------------------------------#
+# main()
+
+# Ensure GPG_PROG is working:
+_gpg --version > /dev/null ||
+    log_fatal $? "Invalid GPG_PROG, see manpage for --gpg-prog"
+
+case ${1:-} in
+    create|init|make|new|touch)	shift; vault_create ${1:+"$@"};;
+    set|add)	shift; vault_set ${1:+"$@"};;
+    get)	shift; vault_get ${1:+"$@"};;  # Print plain text password!
+    forget|unset|delete|rm)
+		shift; vault_forget ${1:+"$@"};;
+    exists|check|test)
+		shift; vault_exists ${1:+"$@"};;
+    list|ls)	shift; vault_list ${1:+"$@"};;	# All entries sanitized
+    read|dump)	shift; vault_read ${1:+"$@"};;	# ALL ENTRIES IN PLAIN TEXT!
+    destroy)	shift; vault_destroy ${1:+"$@"};;
+    "") log_usage "Missing ACTION";;
+    *) log_usage "Invalid ACTION: $1";;
+esac
