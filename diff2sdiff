@@ -1,0 +1,40 @@
+#!/usr/bin/env perl
+# HELP - Run sdiff on pairs of filenames from diff -rq
+# SEE ALSO: ~/etc/init.d/sdiff.sh
+# Q: Newer diff can do -r and --side-by-side in one pass?
+
+use warnings;
+use strict;
+use File::Basename;
+
+my $IDENT = basename($0, '.pl');
+my $USAGE = "diff -rq DIR1 DIR2 | $IDENT [SDIFF_OPTIONS]";
+
+for (@ARGV) {
+    ('-h' eq $_ or '--help' eq $_) and print($USAGE,"\n"),exit(0);
+}
+
+my $columns = $ENV{COLUMNS} || 80;
+my $width = ($columns ? "--width=$columns" : '');
+my $pad = ($columns+1)/2-3;     # LEFT " | " RIGHT
+
+sub sdiff {
+    my ($left, $right) = @_;
+    #my $cr = "\\015";
+    #my @cmd = ('sdiff', $width, @ARGV, $left, $right, qw(| tr -d), $cr);
+    my @cmd = ('sdiff', $width, @ARGV, $left, $right);
+    0 == system("@cmd") or die("$IDENT: error: @cmd: $!\n");
+}
+
+my $diffs;
+while (<STDIN>) {
+    /^Files (.+) and (.+) differ/ and do {
+        my ($left,$right) = ($1, $2);
+        print("\n") if $diffs++; # blank line between diffs
+        # indicate left | right filenames using same format as sdiff
+        printf("%-*.*s | %.*s\n", $pad, $pad, $left, $pad, $right);
+        sdiff($left, $right);
+        next;
+    };
+    print;                      # pass thru Only in, etc
+}
