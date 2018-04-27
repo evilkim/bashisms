@@ -1,0 +1,39 @@
+#!/bin/sh
+# HELP - Runs git diff displaying differences with sdiff(1) instead of diff(1)
+#
+# SYNOPSIS
+# * git sdiff [-s] [-w COLUMNS] [GIT-DIFF-ARGS]
+#
+# SEE ALSO
+# * git_sdiff - Helper called indirectly by git diff to run sdiff(1)
+#
+# AUTHOR <ekimtaylor@gmail.com>
+
+IDENT=${0##*/}
+USAGE="Usage: $IDENT [GIT_SDIFF_OPTS] [--] [GIT-DIFF-ARGS]"
+
+GIT_SDIFF_OPTS=""
+while true; do
+    case "$1" in
+	-h|--help) echo >&2 "$USAGE"; exit 0;;
+
+	# Ignore this and pass all remaining args to git diff
+	--) shift; break;;
+
+	# Explicitly intercept known -OPTION VALUE pairs:
+	# -w) GIT_SDIFF_OPTS="$GIT_SDIFF_OPTS $1 $2"; shift;;
+
+	# But, sdiff dies when conflicting -w COLUMNS given? See git_sdiff.
+	-w) export COLUMNS="$2"; shift;;  # override the default from stty(1)
+
+	# Accumulate all remaining -FLAGS (a -OPTION that takes no VALUE):
+	-*) GIT_SDIFF_OPTS="$GIT_SDIFF_OPTS $1";;
+
+	# Not a -OPTION, pass this and all remaining args to git diff
+	*) break;;
+    esac
+    shift
+done
+
+GIT_EXTERNAL_DIFF=git_sdiff GIT_SDIFF_OPTS="$GIT_SDIFF_OPTS" git diff "$@"
+exit
