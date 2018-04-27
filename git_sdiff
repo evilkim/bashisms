@@ -1,0 +1,50 @@
+#!/bin/sh
+# HELP - Helper called indirectly by git-sdiff and/or git-log
+#
+# SYNOPSIS
+# * GIT_EXTERNAL_DIFF=git_sdiff git diff [GIT_SDIFF_OPTS] [--] [...]"
+# * GIT_EXTERNAL_DIFF=git_sdiff [GIT_SDIFF_OPTS="{-s|-l|...}"] git log -p [...]
+#
+# SEE ALSO
+# * git-sdiff - User facing command that leverages this script
+#
+# AUTHOR <ekimtaylor@gmail.com>
+
+IDENT=${0##*/}
+USAGE="Usage: git-sdiff [...] /* Calls $IDENT indirectly */"
+
+# By default, Git passes the following seven arguments to the diff program:
+# path old-file old-hex old-mode new-file new-hex new-mode
+
+case "$1" in -h|--help) echo >&2 "$USAGE"; exit 0;; esac
+case "$#" in 7) true;; *) echo >&2 "$USAGE"; exit 2;; esac
+
+path="$1"
+oldfile="$2"
+oldhex="$3"
+oldmode="$4"
+newfile="$5"
+newhex="$6"
+newmode="$7"
+
+echo "************************************************************************"
+echo "$IDENT: info: $@"
+if [[ "$newfile" == "/dev/null" ]]; then
+    echo "$IDENT: info: $path: deleted"
+    # nothing more to report
+    exit 0		       # N.B. non-zero status aborts git-diff!
+elif [[ "$oldmode" != "$newmode" ]]; then
+    echo "$IDENT: info: $path: mode changed from $oldmode to $newmode"
+    # continue to display any other differences
+fi
+
+_sdiff() {
+    if [[ -z "$COLUMNS" ]]; then
+        COLUMNS=$(stty -a | perl -lne '/columns (\d+)/ and print $1');
+    fi;
+    (set -x; sdiff ${COLUMNS:+-w $COLUMNS} "$@") 2>&1
+}
+
+_sdiff ${GIT_SDIFF_OPTS} "${oldfile}" "${newfile}"
+
+exit 0			       # N.B. non-zero status aborts git-diff!
