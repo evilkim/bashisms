@@ -1,2 +1,2 @@
 # bashisms
-Generic Bash tools
+Generic tools, primarily written in Bash.
