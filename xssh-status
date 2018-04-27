@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+# HELP - Set exit status of xssh -m to value last seen as /^stderr\tSTATUS/
+# Remaps captured stderr (lines not matching /^\t/) to stderr.
+# TODO: Handle default xssh output format as well: /^HOSTNAME\tSTATUS/
+# TODO: Fold this feature into xssh itself.
+
+use warnings;
+use strict;
+use File::Basename;
+
+my $status = 0;
+while (<>) {
+    if (/^\t/) {
+	print STDOUT;
+    } else {
+	$status = $1 if (/^status\s+(\d+)/);
+	print STDERR;
+    }
+}
+
+warn(basename($0).": command exited with non-zero status: $status\n")
+    if $status;
+exit($status);
