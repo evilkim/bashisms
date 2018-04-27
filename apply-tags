@@ -1,0 +1,53 @@
+#!/usr/bin/perl -s
+# HELP - List @tags associated with HOST...
+#
+# DESCRIPTION
+#
+# Scans the inventory of apply @tags and prints those associated with HOST(s):
+#	TAG\tHOST[,HOST]...
+#
+# SEE ALSO
+# * apply
+
+use warnings;
+use strict;
+use vars qw($DEBUG $REVERSE);
+
+# handle simple -s(witches)
+{
+    use vars qw($d $debug $r $reverse);	# cannot include $-VARNAME here?!
+    no strict qw(refs);
+    $DEBUG++ if ($d or $debug or ${-debug});  # allow -d, -debug, or --debug
+    $REVERSE++ if ($r or $reverse);  # allow -r or -reverse
+}
+
+my (%TAGS, %HOSTS);
+
+for my $HOST (@ARGV) {
+    open(TAGS, "apply -L |") or die;
+    while (<TAGS>) {
+	chomp;
+	(/^\s*([@]\S+)\s+.*\b(${HOST})\b.*/) and do {
+	    $TAGS{$1}->{$2}++;
+	    $HOSTS{$2}->{$1}++;	 # --reverse
+	    next;
+	};
+    }
+    close(TAGS);
+}
+
+END {
+    if ($REVERSE) {
+	for my $host (sort keys %HOSTS) {
+	    warn("host=[$host]\n") if $DEBUG;
+	    printf(qq(%-15s\t%s\n), $host,
+		   join(",", sort keys %{ $HOSTS{$host} }));
+	}
+    } else {
+	for my $tag (sort keys %TAGS) {
+	    warn("tag=[$tag]\n") if $DEBUG;
+	    printf(qq(%-15s\t%s\n), $tag,
+		   join(",", sort keys %{ $TAGS{$tag} }));
+	}
+    }
+}
