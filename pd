@@ -1,0 +1,38 @@
+#!/bin/bash
+# HELP - Wrapper around pushd, popd, and dirs
+# USAGE - source ~/bin/pd
+# SYNOPSIS
+# pd [+] [DIR]  -- pushd [DIR]
+# pd - [DIRn]   -- popd [DIRn]
+# pd =          -- dirs
+
+function dirs  {
+    command dirs |
+        perl -lae '
+my $ln = 0;
+for my $dir (@F) {
+    if ($ln) {
+        print STDOUT ((($ln < 10) ? " " : "")."+${ln}\t${dir}");
+    } else {
+        print STDOUT ("pwd\t$dir");
+    }
+    $ln++;
+}'
+}
+
+function pushd { command pushd $* >/dev/null; dirs; }
+
+function popd  { command popd  $* > /dev/null; dirs; }
+
+function pd {
+    case "$1" in
+        +) shift; pushd $*;;
+        -) shift; popd $*;;
+        =) dirs;;
+        *) pushd $*;;
+    esac
+}
+
+case $# in 0) ;; *) echo >&2 "Usage: source $0"; exit 2;; esac
+
+echo "${BASH_SOURCE##*/} [re]loaded"
