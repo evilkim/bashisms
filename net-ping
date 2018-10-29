@@ -1,7 +1,8 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -s
 
 use warnings;
 use strict;
+use vars qw($TIMEOUT);
 
 use Net::Ping;
 use File::Basename;
@@ -12,7 +13,7 @@ my $USAGE = "Usage: $IDENT METHOD HOST...\n".
     "\tMETHOD := icmp | tcp PORTS | syn PORTS\n".
     "\tPORTS := PORT[,PORT]...\n";
 
-my $TIMEOUT = 7;		# (5 is the default)
+$TIMEOUT //= 7;		# (5 is the default)
 
 my $STATUS = 0;		     # 0 => EX_OK (PASS), 1 => EX_ERROR (FAIL)
 
